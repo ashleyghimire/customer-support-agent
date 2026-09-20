@@ -64,7 +64,7 @@ os.environ["BYPASS_TOOL_CONSENT"] = "true"
 # REGION:     your AWS region, e.g. "us-east-1"
 # MEMORY_ID   format: shown in the AgentCore Memory console
 
-GATEWAY_URL = "https://bugreports-gateway-rrg6dqscge.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"   # TODO: Replace with your Gateway URL
+GATEWAY_URL = "https://customersupportgateway-ub6brbogpk.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"   # TODO: Replace with your Gateway URL
 KB_ID       = "UYHXUR4O7X"          # TODO: Replace with your Knowledge Base ID
 REGION = "us-east-1"        # TODO: Replace with your AWS region
 MEMORY_ID   = "CustomerSupportMemory-3nvQJtAkDs"        # TODO: Replace with your Memory ID
@@ -165,9 +165,12 @@ class MemoryHook(HookProvider):
         self.memory_client = memory_client
         self.memory_id = memory_id
         self.namespaces = get_namespaces(memory_client, memory_id)
+        self._context_added = False
 
     def retrieve_customer_context(self, event: MessageAddedEvent):
         """Retrieve relevant long-term memories and add them to the user message."""
+        if self._context_added:
+            return
         messages = event.agent.messages
 
         if not messages:
@@ -259,6 +262,10 @@ class MemoryHook(HookProvider):
                         ]
 
                     break
+
+        # Prevent this hook from repeatedly enriching the same
+        # user message when additional MessageAddedEvent events fire.
+        self._context_added = True
 
     def save_support_interaction(self, event: AfterInvocationEvent):
         """Save the latest customer question and assistant response."""
@@ -354,7 +361,37 @@ def search_knowledge_base(query: str) -> str:
         Relevant information retrieved from the knowledge base
     """
     # TODO: Implement the Knowledge Base search
-    pass
+    if not KB_ID:
+        return "Knowledge base not configured."
+
+    try:
+        response = _bedrock_runtime.retrieve(
+            knowledgeBaseId=KB_ID,
+            retrievalQuery={"text": query},
+        )
+
+        results = response.get("retrievalResults", [])
+
+        if not results:
+            return "No relevant information found in the knowledge base."
+
+        chunks = []
+
+        for result in results:
+            content = result.get("content", {})
+            text = content.get("text")
+
+            if text:
+                chunks.append(text)
+
+        if not chunks:
+            return "No relevant information found in the knowledge base."
+
+        return "\n---\n".join(chunks)
+
+    except Exception as e:
+        logger.warning("Knowledge base search failed: %s", e)
+        return f"Knowledge base search failed: {e}"
 
 
 # ── TODO 7 — Loyalty Discount Tool (Code Interpreter) ────────────────────────
@@ -395,15 +432,150 @@ def calculate_loyalty_discount(
         Full discount breakdown and final price
     """
     # TODO: Build the code string (use an f-string to inject the arguments)
-    code = ""  # Replace with your code string
+    code = f"""
+import json
+import math
+
+loyalty_points = {int(loyalty_points)}
+tier = {tier!r}
+order_total = {float(order_total)}
+product_category = {product_category!r}
+
+earn_rates = {{
+    "standard": 1,
+    "device": 2,
+    "fresh": 5,
+}}
+
+tier_rates = {{
+    "Silver": 0.00,
+    "Gold": 0.10,
+    "Platinum": 0.15,
+}}
+
+# Points can only be redeemed in blocks of 500.
+# Redemption is capped at 50% of the order total.
+max_points_value = order_total * 0.50
+max_redeemable_points = math.floor(max_points_value / 0.01)
+points_redeemed = min(
+    loyalty_points // 500 * 500,
+    max_redeemable_points,
+)
+points_value = points_redeemed * 0.01
+
+subtotal_after_points = order_total - points_value
+
+tier_discount_pct = tier_rates.get(tier, 0.00)
+tier_discount = subtotal_after_points * tier_discount_pct
+
+final_total = subtotal_after_points - tier_discount
+total_savings = points_value + tier_discount
+
+points_earned = math.floor(
+    final_total * earn_rates.get(product_category, 1)
+)
+
+remaining_points = loyalty_points - points_redeemed
+
+result = {{
+    "points_redeemed": points_redeemed,
+    "tier_discount_pct": tier_discount_pct,
+    "tier_discount": round(tier_discount, 2),
+    "points_value": round(points_value, 2),
+    "final_total": round(final_total, 2),
+    "total_savings": round(total_savings, 2),
+    "points_earned": points_earned,
+    "remaining_points": remaining_points,
+}}
+
+print(json.dumps(result))
+"""
 
     try:
-        # TODO: Execute the code using code_session and return the result
-        pass
+        with code_session(REGION) as code_client:
+            result = code_client.invoke(
+                "executeCode",
+                {
+                    "language": "python",
+                    "code": code,
+                },
+            )
+
+        if not result:
+            return json.dumps({
+                "error": "Code Interpreter returned no result."
+            })
+
+        stream = result.get("stream")
+
+        if stream is None:
+            return json.dumps({
+                "error": "Code Interpreter response did not contain a stream."
+            })
+
+        events = list(stream)
+
+        if not events:
+            return json.dumps({
+                "error": "Code Interpreter stream returned no events."
+            })
+
+        event = events[-1]
+        event_result = event.get("result", {})
+
+        if event_result.get("isError"):
+            structured = event_result.get("structuredContent", {})
+            return json.dumps({
+                "error": "Code Interpreter execution failed.",
+                "stderr": structured.get("stderr", ""),
+                "stdout": structured.get("stdout", ""),
+            })
+
+        structured = event_result.get("structuredContent", {})
+        stdout = structured.get("stdout", "")
+
+        if stdout:
+            try:
+                calculation = json.loads(stdout)
+                return (
+                    f"Points redeemed: {calculation['points_redeemed']}\n"
+                    f"Tier discount: {calculation['tier_discount_pct'] * 100:.0f}% "
+                    f"(${calculation['tier_discount']:.2f})\n"
+                    f"Points value discount: ${calculation['points_value']:.2f}\n"
+                    f"Final total: ${calculation['final_total']:.2f}\n"
+                    f"Total savings: ${calculation['total_savings']:.2f}\n"
+                    f"Points earned: {calculation['points_earned']}\n"
+                    f"Remaining points: {calculation['remaining_points']}"
+                )
+            except (json.JSONDecodeError, KeyError, TypeError):
+                return stdout.strip()
+
+        return json.dumps(structured)
 
     except Exception as e:
-        # TODO: Implement fallback calculation using tier discount only
-        pass
+        logger.warning("Code Interpreter unavailable: %s", e)
+
+        tier_rates = {
+            "Silver": 0.00,
+            "Gold": 0.10,
+            "Platinum": 0.15,
+        }
+
+        tier_discount_pct = tier_rates.get(tier, 0.00)
+        tier_discount = order_total * tier_discount_pct
+        final_total = order_total - tier_discount
+
+        return json.dumps({
+            "points_redeemed": 0,
+            "tier_discount_pct": tier_discount_pct,
+            "tier_discount": round(tier_discount, 2),
+            "points_value": 0.00,
+            "final_total": round(final_total, 2),
+            "total_savings": round(tier_discount, 2),
+            "points_earned": 0,
+            "remaining_points": loyalty_points,
+            "fallback": True,
+        })
 
 
 # ── TODO 8 — Agent Entrypoint ─────────────────────────────────────────────────
@@ -425,14 +597,82 @@ def calculate_loyalty_discount(
 async def invoke(payload, context=None):
     """
     Main handler called by AgentCore for every incoming request.
-
     Expected payload keys:
       prompt      (str, required) — the customer's message
       customer_id (str, optional) — unique customer identifier
       session_id  (str, optional) — session identifier; generated if absent
     """
-    # TODO: Implement the agent invocation
-    pass
+    prompt = payload.get("prompt", "")
+    customer_id = payload.get("customer_id", "anonymous")
+    session_id = payload.get("session_id") or str(uuid.uuid4())
+
+    if not prompt:
+        return "Please provide a customer support question or request."
+
+    memory_hook = MemoryHook(
+        actor_id=customer_id,
+        session_id=session_id,
+        memory_client=memory_client,
+        memory_id=MEMORY_ID,
+    )
+
+    browser = AgentCoreBrowser(region=REGION)
+
+    mcp = MCPClient(url=GATEWAY_URL)
+    gateway_tools = await mcp.load_tools()
+
+    system_prompt = """
+You are an AI customer support assistant for an e-commerce store.
+
+Your job is to help customers with:
+1. Order tracking and order information.
+2. Returns and refunds.
+3. Product information and recommendations.
+4. Loyalty program questions and discount calculations.
+5. General customer support questions.
+
+Tool usage rules:
+
+- For order tracking, order information, or customer order information,
+  use the appropriate order-tracker Gateway tool.
+- For refunds, refund status, or return labels, use the appropriate
+  refund-processor Gateway tool.
+- For product specifications, product information, return policies,
+  warranty information, loyalty program details, and other store
+  knowledge, use the search_knowledge_base tool.
+- For loyalty discount calculations, use calculate_loyalty_discount exactly once.
+- Do not perform the loyalty calculation yourself.
+- After receiving the tool result, treat its values as authoritative.
+- Do not recalculate, reinterpret, or replace any monetary value returned
+  by the loyalty calculation tool.
+- In the final response, use the exact values returned by the tool for
+  points redeemed, points discount, tier discount, final total, total
+  savings, points earned, and remaining points.
+- Do not call calculate_loyalty_discount again unless the customer
+  provides new or corrected calculation inputs.
+- For requests involving live websites or web pages, use the browser tool.
+- Use information returned by tools as the source of truth.
+- Do not invent order details, refund information, product information,
+  or loyalty results.
+- If required information is missing, ask the customer for it.
+- Keep responses clear and helpful.
+"""
+
+    agent = Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[
+            *gateway_tools,
+            search_knowledge_base,
+            calculate_loyalty_discount,
+            browser.browser,
+        ],
+        hooks=[memory_hook],
+    )
+
+    result = await agent.invoke_async(prompt)
+
+    return str(result)
 
 
 # ── CLI entry point (do not modify) ──────────────────────────────────────────
@@ -448,4 +688,4 @@ def main():
 if __name__ == "__main__":
     app.run()
     # Uncomment the line below and comment app.run() for local CLI testing:
-    # main()
+    #main()
